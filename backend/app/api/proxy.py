@@ -114,12 +114,29 @@ async def anthropic_to_openai_payload(payload: dict, default_model: str, enabled
         logger.info(f"Mapping requested model '{model_id}' to configured model '{default_model}'")
         model_id = default_model
     
+    booster_instructions = ""
+    if "nemotron" in model_id.lower():
+        booster_instructions = (
+            "\n\n[DRITI GATEWAY OPTIMIZATION FOR NEMOTRON]: "
+            "You are an expert AI software architect and coding assistant. "
+            "When writing code, prioritize clean, production-ready implementations with robust error handling. "
+            "If executing tool calls or function calls, provide precise arguments. "
+            "Before complex code changes, brief your architectural plan concisely."
+        )
+    elif "glm" in model_id.lower() or "gpt" in model_id.lower():
+        booster_instructions = (
+            "\n\n[DRITI GATEWAY OPTIMIZATION]: "
+            "Maintain extreme technical accuracy, concise explanations, and exact adherence to tool schemas and formatting requirements."
+        )
+
     openai_messages = []
     if "system" in payload and payload["system"]:
         sys_val = payload["system"]
         if isinstance(sys_val, list):
             sys_val = " ".join([p.get("text", "") for p in sys_val if isinstance(p, dict) and p.get("type") == "text"])
-        openai_messages.append({"role": "system", "content": str(sys_val)})
+        openai_messages.append({"role": "system", "content": str(sys_val) + booster_instructions})
+    elif booster_instructions:
+        openai_messages.append({"role": "system", "content": booster_instructions.strip()})
         
     for msg in payload.get("messages", []):
         role = msg.get("role")
@@ -282,12 +299,33 @@ async def create_message(
     
     if is_streaming:
         return StreamingResponse(
-            _stream_generator(mapped_payload, api_key, db, user.id, start_time, request.client.host, req_model),
+            _stream_generator(mapped_payload, api_key, db, user.id, start_time, request.client.host, req_model, enabled_models),
             media_type="text/event-stream"
         )
     else:
         try:
-            response = await call_nvidia_chat(api_key, mapped_payload)
+            candidates = [req_model]
+            for fallback in ["nvidia/nemotron-3-super-120b-a12b", "openai/gpt-oss-120b", "z-ai/glm-5.2", "nvidia/nemotron-3-ultra-550b-a55b"]:
+                if fallback in enabled_models and fallback not in candidates:
+                    candidates.append(fallback)
+                    
+            response = None
+            actual_model = req_model
+            
+            for attempt_idx, candidate_model in enumerate(candidates):
+                try:
+                    if attempt_idx > 0:
+                        logger.warning(f"[FAILOVER RETRY] Attempt {attempt_idx+1}: Model '{actual_model}' failed. Failing over to '{candidate_model}'...")
+                        mapped_payload["model"] = candidate_model
+                        actual_model = candidate_model
+                        req_model = candidate_model
+                    response = await call_nvidia_chat(api_key, mapped_payload)
+                    break
+                except Exception as e:
+                    logger.error(f"[FAILOVER ERROR] Model '{candidate_model}' failed with: {e}")
+                    if attempt_idx == len(candidates) - 1:
+                        raise e
+
             latency = int((time.time() - start_time) * 1000)
             
             usage = response.get("usage", {})
@@ -373,54 +411,77 @@ async def _stream_generator(mapped_payload, api_key, db, user_id, start_time, ip
         tool_blocks = {}
         finish_reason = None
         
-        async for chunk_text in stream_nvidia_chat(api_key, mapped_payload):
-            if chunk_text.startswith("data: "):
-                try:
-                    data_str = chunk_text[6:].strip()
-                    if data_str == "[DONE]":
-                        continue
+        candidates = [req_model]
+        if enabled_models:
+            for fallback in ["nvidia/nemotron-3-super-120b-a12b", "openai/gpt-oss-120b", "z-ai/glm-5.2", "nvidia/nemotron-3-ultra-550b-a55b"]:
+                if fallback in enabled_models and fallback not in candidates:
+                    candidates.append(fallback)
                     
-                    data = json.loads(data_str)
-                    if "usage" in data and data["usage"]:
-                        prompt_tokens = data["usage"].get("prompt_tokens", prompt_tokens)
-                        completion_tokens = data["usage"].get("completion_tokens", completion_tokens)
-                        
-                    choice = data["choices"][0]
-                    if choice.get("finish_reason"):
-                        finish_reason = choice.get("finish_reason")
-                        
-                    delta = choice.get("delta", {})
-                    content = delta.get("content", "")
-                    
-                    if content:
-                        if not text_started:
-                            yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
-                            text_started = True
-                        yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'text_delta', 'text': content}})}\n\n"
-                        
-                    tool_calls = delta.get("tool_calls", [])
-                    for tc in tool_calls:
-                        tc_idx = tc.get("index", 0)
-                        if text_started:
-                            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
-                            text_started = False
-                            block_index += 1
+        success_stream = False
+        
+        for attempt_idx, candidate_model in enumerate(candidates):
+            if attempt_idx > 0:
+                logger.warning(f"[STREAM FAILOVER] Attempt {attempt_idx+1}: Failing over to '{candidate_model}'...")
+                mapped_payload["model"] = candidate_model
+                req_model = candidate_model
+                
+            try:
+                async for chunk_text in stream_nvidia_chat(api_key, mapped_payload):
+                    if chunk_text.startswith("data: "):
+                        try:
+                            data_str = chunk_text[6:].strip()
+                            if data_str == "[DONE]":
+                                continue
                             
-                        target_block_idx = block_index + tc_idx
-                        if target_block_idx not in tool_blocks:
-                            fn = tc.get("function", {})
-                            t_id = tc.get("id", f"toolu_{int(time.time()*1000)}_{target_block_idx}")
-                            t_name = fn.get("name", "unknown_tool")
-                            tool_blocks[target_block_idx] = {"id": t_id, "name": t_name}
-                            yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': target_block_idx, 'content_block': {'type': 'tool_use', 'id': t_id, 'name': t_name, 'input': {}}})}\n\n"
+                            data = json.loads(data_str)
+                            if "usage" in data and data["usage"]:
+                                prompt_tokens = data["usage"].get("prompt_tokens", prompt_tokens)
+                                completion_tokens = data["usage"].get("completion_tokens", completion_tokens)
+                                
+                            choice = data["choices"][0]
+                            if choice.get("finish_reason"):
+                                finish_reason = choice.get("finish_reason")
+                                
+                            delta = choice.get("delta", {})
+                            content = delta.get("content", "")
                             
-                        fn = tc.get("function", {})
-                        args_delta = fn.get("arguments", "")
-                        if args_delta:
-                            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': target_block_idx, 'delta': {'type': 'input_json_delta', 'partial_json': args_delta}})}\n\n"
-                            
-                except Exception as e:
-                    logger.error(f"Error parsing chunk: {e}")
+                            if content:
+                                if not text_started:
+                                    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+                                    text_started = True
+                                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'text_delta', 'text': content}})}\n\n"
+                                success_stream = True
+                                
+                            tool_calls = delta.get("tool_calls", [])
+                            for tc in tool_calls:
+                                tc_idx = tc.get("index", 0)
+                                if text_started:
+                                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
+                                    text_started = False
+                                    block_index += 1
+                                    
+                                target_block_idx = block_index + tc_idx
+                                if target_block_idx not in tool_blocks:
+                                    fn = tc.get("function", {})
+                                    t_id = tc.get("id", f"toolu_{int(time.time()*1000)}_{target_block_idx}")
+                                    t_name = fn.get("name", "unknown_tool")
+                                    tool_blocks[target_block_idx] = {"id": t_id, "name": t_name}
+                                    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': target_block_idx, 'content_block': {'type': 'tool_use', 'id': t_id, 'name': t_name, 'input': {}}})}\n\n"
+                                    
+                                fn = tc.get("function", {})
+                                args_delta = fn.get("arguments", "")
+                                if args_delta:
+                                    yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': target_block_idx, 'delta': {'type': 'input_json_delta', 'partial_json': args_delta}})}\n\n"
+                                success_stream = True
+                                    
+                        except Exception as e:
+                            logger.error(f"Error parsing chunk: {e}")
+                if success_stream or not (not text_started and not tool_blocks):
+                    break # Stream connected and executed!
+            except Exception as e:
+                logger.error(f"[STREAM ERROR] Model '{candidate_model}' failed: {e}")
+                if success_stream or attempt_idx == len(candidates) - 1:
+                    raise e
                     
         if not text_started and not tool_blocks:
             yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
