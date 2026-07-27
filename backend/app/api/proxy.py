@@ -116,18 +116,67 @@ async def anthropic_to_openai_payload(payload: dict, default_model: str, enabled
     
     openai_messages = []
     if "system" in payload and payload["system"]:
-        openai_messages.append({"role": "system", "content": payload["system"]})
+        sys_val = payload["system"]
+        if isinstance(sys_val, list):
+            sys_val = " ".join([p.get("text", "") for p in sys_val if isinstance(p, dict) and p.get("type") == "text"])
+        openai_messages.append({"role": "system", "content": str(sys_val)})
         
     for msg in payload.get("messages", []):
+        role = msg.get("role")
         content = msg.get("content")
-        if isinstance(content, list):
-            # simplify content blocks to string for now if needed, or pass as is if supported
-            text_parts = [part["text"] for part in content if part.get("type") == "text"]
-            content = " ".join(text_parts)
-        openai_messages.append({
-            "role": msg.get("role"),
-            "content": content
-        })
+        
+        if isinstance(content, str):
+            openai_messages.append({"role": role, "content": content})
+        elif isinstance(content, list):
+            text_parts = []
+            tool_calls = []
+            tool_results = []
+            
+            for part in content:
+                if isinstance(part, dict):
+                    ptype = part.get("type")
+                    if ptype == "text":
+                        text_parts.append(part.get("text", ""))
+                    elif ptype == "tool_use":
+                        tool_calls.append({
+                            "id": part.get("id", f"call_{len(tool_calls)}"),
+                            "type": "function",
+                            "function": {
+                                "name": part.get("name"),
+                                "arguments": json.dumps(part.get("input", {}))
+                            }
+                        })
+                    elif ptype == "tool_result":
+                        res_content = part.get("content", "")
+                        if isinstance(res_content, list):
+                            res_content = " ".join([p.get("text", "") for p in res_content if isinstance(p, dict) and p.get("type") == "text"])
+                        tool_results.append({
+                            "tool_call_id": part.get("tool_use_id", ""),
+                            "content": str(res_content)
+                        })
+                elif isinstance(part, str):
+                    text_parts.append(part)
+                    
+            if role == "assistant":
+                msg_dict = {"role": "assistant"}
+                if text_parts:
+                    msg_dict["content"] = " ".join(text_parts)
+                else:
+                    msg_dict["content"] = None
+                if tool_calls:
+                    msg_dict["tool_calls"] = tool_calls
+                openai_messages.append(msg_dict)
+            elif role == "user":
+                if text_parts:
+                    openai_messages.append({"role": "user", "content": " ".join(text_parts)})
+                for tr in tool_results:
+                    openai_messages.append({
+                        "role": "tool",
+                        "tool_call_id": tr["tool_call_id"],
+                        "content": tr["content"]
+                    })
+            else:
+                openai_messages.append({"role": role, "content": " ".join(text_parts)})
         
     mapped_payload = {
         "model": model_id,
@@ -136,7 +185,31 @@ async def anthropic_to_openai_payload(payload: dict, default_model: str, enabled
         "temperature": payload.get("temperature", 1.0),
         "stream": payload.get("stream", False)
     }
+    
+    if "tools" in payload and payload["tools"]:
+        openai_tools = []
+        for t in payload["tools"]:
+            openai_tools.append({
+                "type": "function",
+                "function": {
+                    "name": t["name"],
+                    "description": t.get("description", ""),
+                    "parameters": t.get("input_schema", {"type": "object", "properties": {}})
+                }
+            })
+        mapped_payload["tools"] = openai_tools
+        
+        if "tool_choice" in payload and isinstance(payload["tool_choice"], dict):
+            tc = payload["tool_choice"]
+            if tc.get("type") == "tool" and "name" in tc:
+                mapped_payload["tool_choice"] = {"type": "function", "function": {"name": tc["name"]}}
+            elif tc.get("type") == "any":
+                mapped_payload["tool_choice"] = "required"
+            elif tc.get("type") == "auto":
+                mapped_payload["tool_choice"] = "auto"
+                
     return mapped_payload
+
 
 @router.post("/messages")
 async def create_message(
@@ -221,15 +294,40 @@ async def create_message(
             prompt_tokens = usage.get("prompt_tokens", 0)
             completion_tokens = usage.get("completion_tokens", 0)
             
-            content = response["choices"][0]["message"]["content"]
+            msg_obj = response["choices"][0]["message"]
+            content_text = msg_obj.get("content")
+            tool_calls = msg_obj.get("tool_calls")
             
+            anthropic_content = []
+            if content_text:
+                anthropic_content.append({"type": "text", "text": content_text})
+            
+            if tool_calls:
+                for tc in tool_calls:
+                    fn = tc.get("function", {})
+                    try:
+                        args = json.loads(fn.get("arguments", "{}"))
+                    except Exception:
+                        args = {}
+                    anthropic_content.append({
+                        "type": "tool_use",
+                        "id": tc.get("id", f"toolu_{int(time.time()*1000)}"),
+                        "name": fn.get("name"),
+                        "input": args
+                    })
+            if not anthropic_content:
+                anthropic_content.append({"type": "text", "text": ""})
+                
+            finish_reason = response["choices"][0].get("finish_reason", "end_turn")
+            stop_reason = "tool_use" if (tool_calls or finish_reason == "tool_calls") else ("end_turn" if finish_reason == "stop" else (finish_reason or "end_turn"))
+
             anthropic_response = {
                 "id": response.get("id", "msg_default"),
                 "type": "message",
                 "role": "assistant",
-                "content": [{"type": "text", "text": content}],
+                "content": anthropic_content,
                 "model": req_model,
-                "stop_reason": response["choices"][0].get("finish_reason", "end_turn"),
+                "stop_reason": stop_reason,
                 "stop_sequence": None,
                 "usage": {
                     "input_tokens": prompt_tokens,
@@ -267,11 +365,13 @@ async def _stream_generator(mapped_payload, api_key, db, user_id, start_time, ip
         # Send message_start
         yield f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': 'msg_1', 'type': 'message', 'role': 'assistant', 'model': req_model, 'content': [], 'stop_reason': None, 'stop_sequence': None, 'usage': {'input_tokens': 0, 'output_tokens': 0}}})}\n\n"
         
-        # Send content_block_start
-        yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
-
         prompt_tokens = 0
         completion_tokens = 0
+        
+        block_index = 0
+        text_started = False
+        tool_blocks = {}
+        finish_reason = None
         
         async for chunk_text in stream_nvidia_chat(api_key, mapped_payload):
             if chunk_text.startswith("data: "):
@@ -281,26 +381,58 @@ async def _stream_generator(mapped_payload, api_key, db, user_id, start_time, ip
                         continue
                     
                     data = json.loads(data_str)
-                    
                     if "usage" in data and data["usage"]:
                         prompt_tokens = data["usage"].get("prompt_tokens", prompt_tokens)
                         completion_tokens = data["usage"].get("completion_tokens", completion_tokens)
                         
-                    delta = data["choices"][0].get("delta", {})
-                    content = delta.get("content", "")
-                    if content:
-                        yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': content}})}\n\n"
+                    choice = data["choices"][0]
+                    if choice.get("finish_reason"):
+                        finish_reason = choice.get("finish_reason")
                         
+                    delta = choice.get("delta", {})
+                    content = delta.get("content", "")
+                    
+                    if content:
+                        if not text_started:
+                            yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+                            text_started = True
+                        yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'text_delta', 'text': content}})}\n\n"
+                        
+                    tool_calls = delta.get("tool_calls", [])
+                    for tc in tool_calls:
+                        tc_idx = tc.get("index", 0)
+                        if text_started:
+                            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
+                            text_started = False
+                            block_index += 1
+                            
+                        target_block_idx = block_index + tc_idx
+                        if target_block_idx not in tool_blocks:
+                            fn = tc.get("function", {})
+                            t_id = tc.get("id", f"toolu_{int(time.time()*1000)}_{target_block_idx}")
+                            t_name = fn.get("name", "unknown_tool")
+                            tool_blocks[target_block_idx] = {"id": t_id, "name": t_name}
+                            yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': target_block_idx, 'content_block': {'type': 'tool_use', 'id': t_id, 'name': t_name, 'input': {}}})}\n\n"
+                            
+                        fn = tc.get("function", {})
+                        args_delta = fn.get("arguments", "")
+                        if args_delta:
+                            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': target_block_idx, 'delta': {'type': 'input_json_delta', 'partial_json': args_delta}})}\n\n"
+                            
                 except Exception as e:
                     logger.error(f"Error parsing chunk: {e}")
                     
-        # Send content_block_stop
-        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
-        
-        # Send message_delta
-        yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn', 'stop_sequence': None}, 'usage': {'output_tokens': completion_tokens}})}\n\n"
-        
-        # Send message_stop
+        if not text_started and not tool_blocks:
+            yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+        else:
+            if text_started:
+                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
+            for t_idx in sorted(tool_blocks.keys()):
+                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': t_idx})}\n\n"
+                
+        stop_reason = "tool_use" if (tool_blocks or finish_reason == "tool_calls") else ("end_turn" if finish_reason == "stop" else (finish_reason or "end_turn"))
+        yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason, 'stop_sequence': None}, 'usage': {'output_tokens': completion_tokens}})}\n\n"
         yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
         
         _log_request(db, user_id, req_model, prompt_tokens, completion_tokens, start_time, "success", True, None, ip_address)
