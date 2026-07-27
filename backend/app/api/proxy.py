@@ -20,27 +20,50 @@ def get_anthropic_models(db: Session = Depends(get_db)):
     models = db.query(ModelConfig).filter(ModelConfig.is_enabled == True).all()
     anthropic_models = []
     
-    # Standard Anthropic model aliases for Claude Code and SDK compatibility
-    claude_aliases = [
-        ("claude-3-5-sonnet-20241022", "Claude 3.5 Sonnet"),
-        ("claude-3-5-sonnet-latest", "Claude 3.5 Sonnet (Latest)"),
-        ("claude-3-opus-20240229", "Claude 3 Opus"),
-        ("claude-3-opus-latest", "Claude 3 Opus (Latest)"),
-        ("claude-3-5-haiku-20241022", "Claude 3.5 Haiku"),
-        ("claude-3-5-haiku-latest", "Claude 3.5 Haiku (Latest)"),
-        ("claude-3-haiku-20240307", "Claude 3 Haiku"),
-        ("claude-opus-5", "Claude Opus 5"),
-        ("claude-sonnet-5", "Claude Sonnet 5"),
-        ("claude-3-7-sonnet-20250219", "Claude 3.7 Sonnet"),
-        ("claude-3-7-sonnet-latest", "Claude 3.7 Sonnet (Latest)")
+    # Universal model aliases for Claude Code, Codex, AGY, Cursor, and Aider compatibility
+    universal_aliases = [
+        # Anthropic / Claude Code
+        ("claude-3-5-sonnet-20241022", "Claude 3.5 Sonnet", "anthropic"),
+        ("claude-3-5-sonnet-latest", "Claude 3.5 Sonnet (Latest)", "anthropic"),
+        ("claude-3-opus-20240229", "Claude 3 Opus", "anthropic"),
+        ("claude-3-opus-latest", "Claude 3 Opus (Latest)", "anthropic"),
+        ("claude-3-5-haiku-20241022", "Claude 3.5 Haiku", "anthropic"),
+        ("claude-3-5-haiku-latest", "Claude 3.5 Haiku (Latest)", "anthropic"),
+        ("claude-3-haiku-20240307", "Claude 3 Haiku", "anthropic"),
+        ("claude-opus-5", "Claude Opus 5", "anthropic"),
+        ("claude-sonnet-5", "Claude Sonnet 5", "anthropic"),
+        ("claude-3-7-sonnet-20250219", "Claude 3.7 Sonnet", "anthropic"),
+        ("claude-3-7-sonnet-latest", "Claude 3.7 Sonnet (Latest)", "anthropic"),
+        # OpenAI / Codex / Cursor / Aider
+        ("gpt-4o", "GPT-4o", "openai"),
+        ("gpt-4o-mini", "GPT-4o Mini", "openai"),
+        ("gpt-4o-2024-05-13", "GPT-4o (2024-05-13)", "openai"),
+        ("gpt-4", "GPT-4", "openai"),
+        ("gpt-4-turbo", "GPT-4 Turbo", "openai"),
+        ("gpt-3.5-turbo", "GPT-3.5 Turbo", "openai"),
+        ("codex", "OpenAI Codex", "openai"),
+        ("code-davinci-002", "Code Davinci 002", "openai"),
+        ("o1", "OpenAI o1", "openai"),
+        ("o1-preview", "OpenAI o1 Preview", "openai"),
+        ("o1-mini", "OpenAI o1 Mini", "openai"),
+        ("o3-mini", "OpenAI o3 Mini", "openai"),
+        # Google / Gemini / AGY (Antigravity CLI / SDK)
+        ("gemini-1.5-pro", "Gemini 1.5 Pro", "google"),
+        ("gemini-1.5-flash", "Gemini 1.5 Flash", "google"),
+        ("gemini-2.0-flash-exp", "Gemini 2.0 Flash Exp", "google"),
+        ("gemini-2.5-pro", "Gemini 2.5 Pro", "google"),
+        ("gemini-2.5-flash", "Gemini 2.5 Flash", "google"),
+        ("gemini-pro", "Gemini Pro", "google"),
+        ("antigravity", "Google Antigravity Engine", "google"),
+        ("agy", "AGY Default Engine", "google"),
     ]
     now_iso = datetime.now(timezone.utc).isoformat()
-    for alias_id, alias_name in claude_aliases:
+    for alias_id, alias_name, owner in universal_aliases:
         anthropic_models.append({
             "id": alias_id,
             "type": "model",
             "object": "model",
-            "owned_by": "anthropic",
+            "owned_by": owner,
             "created_at": now_iso,
             "display_name": f"{alias_name} (Routes to NVIDIA)"
         })
