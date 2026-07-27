@@ -1,0 +1,332 @@
+import json
+import time
+from fastapi import APIRouter, Depends, Request, HTTPException
+from fastapi.responses import StreamingResponse
+from sqlalchemy.orm import Session
+from app.core.dependencies import get_db, get_current_user
+from app.models.model_config import ModelConfig
+from app.models.request_log import RequestLog
+from app.models.user import User
+from app.services.nvidia import get_nvidia_api_key, call_nvidia_chat, stream_nvidia_chat
+from datetime import datetime, timezone
+import logging
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+@router.get("/models")
+def get_anthropic_models(db: Session = Depends(get_db)):
+    models = db.query(ModelConfig).filter(ModelConfig.is_enabled == True).all()
+    anthropic_models = []
+    
+    # Standard Anthropic model aliases for Claude Code and SDK compatibility
+    claude_aliases = [
+        ("claude-3-5-sonnet-20241022", "Claude 3.5 Sonnet"),
+        ("claude-3-5-sonnet-latest", "Claude 3.5 Sonnet (Latest)"),
+        ("claude-3-opus-20240229", "Claude 3 Opus"),
+        ("claude-3-opus-latest", "Claude 3 Opus (Latest)"),
+        ("claude-3-5-haiku-20241022", "Claude 3.5 Haiku"),
+        ("claude-3-5-haiku-latest", "Claude 3.5 Haiku (Latest)"),
+        ("claude-3-haiku-20240307", "Claude 3 Haiku"),
+        ("claude-opus-5", "Claude Opus 5"),
+        ("claude-sonnet-5", "Claude Sonnet 5"),
+        ("claude-3-7-sonnet-20250219", "Claude 3.7 Sonnet"),
+        ("claude-3-7-sonnet-latest", "Claude 3.7 Sonnet (Latest)")
+    ]
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for alias_id, alias_name in claude_aliases:
+        anthropic_models.append({
+            "id": alias_id,
+            "type": "model",
+            "object": "model",
+            "owned_by": "anthropic",
+            "created_at": now_iso,
+            "display_name": f"{alias_name} (Routes to NVIDIA)"
+        })
+
+    for m in models:
+        anthropic_models.append({
+            "id": m.model_id,
+            "type": "model",
+            "object": "model",
+            "owned_by": "driti-gateway",
+            "created_at": m.updated_at.isoformat(),
+            "display_name": m.display_name
+        })
+    return {"data": anthropic_models, "object": "list"}
+
+def resolve_model_for_request(payload: dict, db: Session, default_model: str, enabled_models: set) -> str:
+    from app.models.settings import AppSettings
+    settings = db.query(AppSettings).first()
+    mode = settings.routing_mode if settings and settings.routing_mode else "manual"
+    
+    if mode == "auto":
+        prompt_parts = []
+        if "system" in payload and payload["system"]:
+            prompt_parts.append(str(payload["system"]))
+        for msg in payload.get("messages", []):
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                text_parts = [part.get("text", "") for part in content if isinstance(part, dict) and part.get("type") == "text"]
+                prompt_parts.append(" ".join(text_parts))
+            else:
+                prompt_parts.append(str(content))
+        full_prompt = " ".join(prompt_parts).lower()
+        prompt_len = len(full_prompt)
+        
+        heavy_keywords = ["code", "function", "script", "architect", "sql", "redis", "typescript", "python", "react", "fastapi", "docker", "kubernetes", "debug", "error", "algorithm", "database", "class", "async", "schema", "distributed", "test", "build"]
+        massive_keywords = ["100,000", "multi-region", "concurrency", "token-bucket", "enterprise", "system design", "benchmark", "production-ready", "high-throughput", "fault-tolerant", "550b", "ultra"]
+        
+        has_massive = any(k in full_prompt for k in massive_keywords) or prompt_len > 1500
+        has_heavy = any(k in full_prompt for k in heavy_keywords) or prompt_len > 400
+        
+        if has_massive and "nvidia/nemotron-3-ultra-550b-a55b" in enabled_models:
+            logger.info("[AUTO ROUTER] Massive complexity detected -> routing to: nvidia/nemotron-3-ultra-550b-a55b")
+            return "nvidia/nemotron-3-ultra-550b-a55b"
+        elif has_heavy and "nvidia/nemotron-3-super-120b-a12b" in enabled_models:
+            logger.info("[AUTO ROUTER] Heavy coding/reasoning detected -> routing to: nvidia/nemotron-3-super-120b-a12b")
+            return "nvidia/nemotron-3-super-120b-a12b"
+        elif "openai/gpt-oss-120b" in enabled_models and prompt_len > 150:
+            logger.info("[AUTO ROUTER] Analytical instruction detected -> routing to: openai/gpt-oss-120b")
+            return "openai/gpt-oss-120b"
+        elif "z-ai/glm-5.2" in enabled_models:
+            logger.info("[AUTO ROUTER] General chat detected -> routing to: z-ai/glm-5.2")
+            return "z-ai/glm-5.2"
+        else:
+            for fallback_pref in ["nvidia/nemotron-3-super-120b-a12b", "openai/gpt-oss-120b", "z-ai/glm-5.2", "nvidia/nemotron-3-ultra-550b-a55b"]:
+                if fallback_pref in enabled_models:
+                    return fallback_pref
+            return list(enabled_models)[0] if enabled_models else default_model
+            
+    logger.info(f"[MANUAL OVERRIDE] Enforcing locked default model '{default_model}' across all incoming requests.")
+    return default_model
+
+async def anthropic_to_openai_payload(payload: dict, default_model: str, enabled_models: set = None) -> dict:
+    import re
+    raw_model_id = payload.get("model", default_model)
+    model_id = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])|\[\d+m\]?|\]|\[', '', str(raw_model_id)).strip()
+    
+    if not enabled_models:
+        enabled_models = set()
+        
+    if model_id not in enabled_models:
+        logger.info(f"Mapping requested model '{model_id}' to configured model '{default_model}'")
+        model_id = default_model
+    
+    openai_messages = []
+    if "system" in payload and payload["system"]:
+        openai_messages.append({"role": "system", "content": payload["system"]})
+        
+    for msg in payload.get("messages", []):
+        content = msg.get("content")
+        if isinstance(content, list):
+            # simplify content blocks to string for now if needed, or pass as is if supported
+            text_parts = [part["text"] for part in content if part.get("type") == "text"]
+            content = " ".join(text_parts)
+        openai_messages.append({
+            "role": msg.get("role"),
+            "content": content
+        })
+        
+    mapped_payload = {
+        "model": model_id,
+        "messages": openai_messages,
+        "max_tokens": payload.get("max_tokens", 4096),
+        "temperature": payload.get("temperature", 1.0),
+        "stream": payload.get("stream", False)
+    }
+    return mapped_payload
+
+@router.post("/messages")
+async def create_message(
+    request: Request,
+    db: Session = Depends(get_db)
+):
+    # Authenticate via ANTHROPIC_AUTH_TOKEN header
+    auth_header = request.headers.get("anthropic-auth-token") or request.headers.get("authorization")
+    if auth_header and auth_header.startswith("Bearer "):
+        token = auth_header.split(" ")[1]
+    else:
+        token = auth_header
+        
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing auth token")
+    
+    user = None
+    if token.startswith("gw_"):
+        import hashlib
+        from app.models.gateway_token import GatewayToken
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        gw_token = db.query(GatewayToken).filter(GatewayToken.token_hash == token_hash, GatewayToken.is_active == True).first()
+        if gw_token:
+            user = db.query(User).filter(User.id == gw_token.user_id).first()
+            if user and user.is_active:
+                gw_token.last_used_at = datetime.now(timezone.utc)
+                db.commit()
+    else:
+        try:
+            from jose import jwt
+            from app.core.config import settings
+            from app.core.security import ALGORITHM
+            payload_token = jwt.decode(token, settings.SECRET_KEY, algorithms=[ALGORITHM])
+            username = payload_token.get("sub")
+            user = db.query(User).filter(User.username == username).first()
+        except Exception:
+            pass
+
+    if not user or not user.is_active:
+        raise HTTPException(status_code=401, detail="Invalid auth token")
+
+    payload = await request.json()
+    start_time = time.time()
+    
+    default_model_row = db.query(ModelConfig).filter(ModelConfig.is_default == True, ModelConfig.is_enabled == True).first()
+    if not default_model_row:
+        default_model_row = db.query(ModelConfig).filter(ModelConfig.is_enabled == True).first()
+    default_model = default_model_row.model_id if default_model_row else "nvidia/nemotron-3-super-120b-a12b"
+    
+    enabled_models = {m[0] for m in db.query(ModelConfig.model_id).filter(ModelConfig.is_enabled == True).all()}
+    
+    is_streaming = payload.get("stream", False)
+    import re
+    raw_req_model = payload.get("model", default_model)
+    req_model = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])|\[\d+m\]?|\]|\[', '', str(raw_req_model)).strip()
+    payload["model"] = req_model
+    
+    try:
+        api_key = get_nvidia_api_key()
+    except Exception as e:
+        err_str = _format_error(e) if '_format_error' in globals() else str(e)
+        _log_request(db, user.id, req_model, 0, 0, start_time, "error", is_streaming, err_str, request.client.host)
+        raise e
+
+    resolved_model = resolve_model_for_request(payload, db, default_model, enabled_models)
+    payload["model"] = resolved_model
+    req_model = resolved_model
+
+    mapped_payload = await anthropic_to_openai_payload(payload, resolved_model, enabled_models)
+    
+    if is_streaming:
+        return StreamingResponse(
+            _stream_generator(mapped_payload, api_key, db, user.id, start_time, request.client.host, req_model),
+            media_type="text/event-stream"
+        )
+    else:
+        try:
+            response = await call_nvidia_chat(api_key, mapped_payload)
+            latency = int((time.time() - start_time) * 1000)
+            
+            usage = response.get("usage", {})
+            prompt_tokens = usage.get("prompt_tokens", 0)
+            completion_tokens = usage.get("completion_tokens", 0)
+            
+            content = response["choices"][0]["message"]["content"]
+            
+            anthropic_response = {
+                "id": response.get("id", "msg_default"),
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": content}],
+                "model": req_model,
+                "stop_reason": response["choices"][0].get("finish_reason", "end_turn"),
+                "stop_sequence": None,
+                "usage": {
+                    "input_tokens": prompt_tokens,
+                    "output_tokens": completion_tokens
+                }
+            }
+            
+            _log_request(db, user.id, req_model, prompt_tokens, completion_tokens, start_time, "success", False, None, request.client.host)
+            return anthropic_response
+        except Exception as e:
+            err_str = _format_error(e)
+            _log_request(db, user.id, req_model, 0, 0, start_time, "error", False, err_str, request.client.host)
+            status_code = 504 if "Timeout" in err_str or "ReadTimeout" in str(type(e)) else 502
+            from fastapi.responses import JSONResponse
+            return JSONResponse(
+                status_code=status_code,
+                content={
+                    "type": "error",
+                    "error": {
+                        "type": "timeout_error" if status_code == 504 else "api_error",
+                        "message": f"Driti Gateway Error ({req_model}): {err_str}"
+                    }
+                }
+            )
+
+def _format_error(e: Exception) -> str:
+    msg = str(e).strip()
+    if not msg or msg == "":
+        msg = f"{type(e).__name__}: Request timed out or connection closed unexpectedly."
+    return msg
+
+async def _stream_generator(mapped_payload, api_key, db, user_id, start_time, ip_address, original_req_model=None):
+    req_model = original_req_model or mapped_payload["model"]
+    try:
+        # Send message_start
+        yield f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': 'msg_1', 'type': 'message', 'role': 'assistant', 'model': req_model, 'content': [], 'stop_reason': None, 'stop_sequence': None, 'usage': {'input_tokens': 0, 'output_tokens': 0}}})}\n\n"
+        
+        # Send content_block_start
+        yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+
+        prompt_tokens = 0
+        completion_tokens = 0
+        
+        async for chunk_text in stream_nvidia_chat(api_key, mapped_payload):
+            if chunk_text.startswith("data: "):
+                try:
+                    data_str = chunk_text[6:].strip()
+                    if data_str == "[DONE]":
+                        continue
+                    
+                    data = json.loads(data_str)
+                    
+                    if "usage" in data and data["usage"]:
+                        prompt_tokens = data["usage"].get("prompt_tokens", prompt_tokens)
+                        completion_tokens = data["usage"].get("completion_tokens", completion_tokens)
+                        
+                    delta = data["choices"][0].get("delta", {})
+                    content = delta.get("content", "")
+                    if content:
+                        yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': content}})}\n\n"
+                        
+                except Exception as e:
+                    logger.error(f"Error parsing chunk: {e}")
+                    
+        # Send content_block_stop
+        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+        
+        # Send message_delta
+        yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn', 'stop_sequence': None}, 'usage': {'output_tokens': completion_tokens}})}\n\n"
+        
+        # Send message_stop
+        yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+        
+        _log_request(db, user_id, req_model, prompt_tokens, completion_tokens, start_time, "success", True, None, ip_address)
+    except Exception as e:
+        err_str = _format_error(e)
+        _log_request(db, user_id, req_model, 0, 0, start_time, "error", True, err_str, ip_address)
+        yield f"event: error\ndata: {json.dumps({'type': 'error', 'error': {'type': 'timeout_error' if 'Timeout' in err_str else 'api_error', 'message': f'Driti Gateway Error ({req_model}): {err_str}'}})}\n\n"
+
+def _log_request(db, user_id, model, prompt_tokens, completion_tokens, start_time, status, is_streaming, error_message, ip_address):
+    try:
+        latency = int((time.time() - start_time) * 1000)
+        log_entry = RequestLog(
+            timestamp=datetime.now(timezone.utc),
+            user_id=user_id,
+            model=model,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+            latency_ms=latency,
+            status=status,
+            is_streaming=is_streaming,
+            error_message=error_message,
+            ip_address=ip_address
+        )
+        db.add(log_entry)
+        db.commit()
+    except Exception as e:
+        logger.error(f"Failed to log request: {e}")
+        db.rollback()
