@@ -24,7 +24,37 @@ export const SettingsPage = () => {
   const [savingKey, setSavingKey] = useState(false);
   const [savingConfig, setSavingConfig] = useState(false);
   const [validationResult, setValidationResult] = useState<{ valid: boolean; message: string } | null>(null);
+  const [newUsername, setNewUsername] = useState('');
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [updatingProfile, setUpdatingProfile] = useState(false);
   const { toast } = useToast();
+
+  const handleUpdateProfile = async () => {
+    if (!newUsername.trim() && !newPassword.trim()) return;
+    if (newPassword && !currentPassword) {
+      toast({ title: 'Current password required', description: 'Please enter your current password to set a new one.', variant: 'destructive' });
+      return;
+    }
+    setUpdatingProfile(true);
+    try {
+      const { data } = await api.put('/auth/update-profile', {
+        username: newUsername.trim() || undefined,
+        current_password: currentPassword || undefined,
+        new_password: newPassword || undefined
+      });
+      localStorage.setItem('token', data.access_token);
+      localStorage.setItem('user', JSON.stringify(data.user));
+      toast({ title: 'Credentials updated successfully ✓' });
+      setCurrentPassword('');
+      setNewPassword('');
+      setNewUsername('');
+    } catch (err: any) {
+      toast({ title: 'Update failed', description: err.response?.data?.detail || 'Could not update profile', variant: 'destructive' });
+    } finally {
+      setUpdatingProfile(false);
+    }
+  };
 
   useEffect(() => {
     (async () => {
@@ -255,6 +285,64 @@ export const SettingsPage = () => {
           </div>
         </CardContent>
       </Card>
+
+      {/* Account Security Card */}
+      <Card>
+        <CardHeader>
+          <div className="flex items-center gap-3">
+            <div className="p-2.5 bg-primary/10 rounded-lg border border-primary/20">
+              <Key className="h-5 w-5 text-primary" />
+            </div>
+            <div>
+              <CardTitle>Account Security & Login Credentials</CardTitle>
+              <CardDescription>Update your admin username and password for logging into Driti Gateway.</CardDescription>
+            </div>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="grid gap-4 md:grid-cols-2">
+            <div className="space-y-2">
+              <Label htmlFor="new-username">New Username (Optional)</Label>
+              <Input
+                id="new-username"
+                placeholder="Leave blank to keep current"
+                value={newUsername}
+                onChange={(e) => setNewUsername(e.target.value)}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="current-password">Current Password (Required for password change)</Label>
+              <Input
+                id="current-password"
+                type="password"
+                placeholder="Enter current password"
+                value={currentPassword}
+                onChange={(e) => setCurrentPassword(e.target.value)}
+              />
+            </div>
+            <div className="space-y-2 md:col-span-2">
+              <Label htmlFor="new-password">New Password (Optional)</Label>
+              <Input
+                id="new-password"
+                type="password"
+                placeholder="Enter new admin password"
+                value={newPassword}
+                onChange={(e) => setNewPassword(e.target.value)}
+              />
+            </div>
+          </div>
+          <div className="pt-2">
+            <Button
+              onClick={handleUpdateProfile}
+              disabled={updatingProfile || (!newUsername.trim() && !newPassword.trim())}
+              className="w-full sm:w-auto"
+            >
+              {updatingProfile ? 'Updating...' : 'Update Login Credentials'}
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
     </motion.div>
   );
 };
+

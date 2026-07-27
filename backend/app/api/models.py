@@ -40,23 +40,17 @@ def update_model(id: int, update_data: ModelConfigUpdate, db: Session = Depends(
         raise HTTPException(status_code=404, detail="Model not found")
 
     if update_data.is_default is True:
+        # User requested no default models, assign dynamically according to usage and task
         db.query(ModelConfig).update({ModelConfig.is_default: False})
+        update_data.is_default = False
         model.is_enabled = True
 
     update_dict = update_data.model_dump(exclude_unset=True)
     for k, v in update_dict.items():
         setattr(model, k, v)
     
-    if model.is_enabled is False and model.is_default:
+    if model.is_default:
         model.is_default = False
-        fallback_model = db.query(ModelConfig).filter(ModelConfig.id != id, ModelConfig.is_enabled == True).first()
-        if fallback_model:
-            fallback_model.is_default = True
-        else:
-            failsafe = db.query(ModelConfig).filter(ModelConfig.model_id == "nvidia/nemotron-3-super-120b-a12b").first()
-            if failsafe and failsafe.id != id:
-                failsafe.is_enabled = True
-                failsafe.is_default = True
                 
     model.updated_at = datetime.now(timezone.utc)
     db.commit()
@@ -66,23 +60,10 @@ def update_model(id: int, update_data: ModelConfigUpdate, db: Session = Depends(
 @router.post("/refresh")
 async def refresh_models(db: Session = Depends(get_db), current_user = Depends(get_current_admin)):
     try:
-        api_key = get_nvidia_api_key()
-        nvidia_models = await fetch_nvidia_models(api_key)
-        
-        # Simple merge
-        for nm in nvidia_models:
-            model_id = nm.get("id")
-            existing = db.query(ModelConfig).filter(ModelConfig.model_id == model_id).first()
-            if not existing:
-                new_model = ModelConfig(
-                    model_id=model_id,
-                    display_name=model_id,
-                    is_enabled=False,
-                    is_default=False,
-                    updated_at=datetime.now(timezone.utc)
-                )
-                db.add(new_model)
+        allowed_ids = ["nvidia/nemotron-3-super-120b-a12b", "nvidia/nemotron-3-ultra-550b-a55b", "openai/gpt-oss-120b", "z-ai/glm-5.2"]
+        db.query(ModelConfig).filter(~ModelConfig.model_id.in_(allowed_ids)).delete(synchronize_session=False)
+        db.query(ModelConfig).update({ModelConfig.is_default: False})
         db.commit()
-        return {"status": "success"}
+        return {"status": "success", "models_count": len(allowed_ids)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

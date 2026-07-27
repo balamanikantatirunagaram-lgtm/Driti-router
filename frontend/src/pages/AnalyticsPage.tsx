@@ -15,7 +15,7 @@ export const AnalyticsPage = () => {
   const fetchAnalytics = async (p: string) => {
     try {
       setLoading(true);
-      const res = await api.get(`/analytics/summary?period=${p}`).then(r => r.data).catch(() => null);
+      const res = await api.get(`/api/analytics/summary?period=${p}`).then(r => r.data).catch(() => null);
       if (res) {
         setData(res);
       } else {
@@ -54,10 +54,8 @@ export const AnalyticsPage = () => {
   };
 
   const formatPercent = (num: number) => {
-    if (num === undefined || num === null) return '0.0%';
-    // If backend returns percentage 0..100 directly
-    if (num > 1) return num.toFixed(1) + '%';
-    return (num * 100).toFixed(1) + '%';
+    if (num === undefined || num === null || isNaN(num)) return '0.0%';
+    return Number(num).toFixed(1) + '%';
   };
 
   const COLORS = ['#3b82f6', '#10b981', '#8b5cf6', '#f59e0b', '#ef4444', '#ec4899', '#06b6d4'];

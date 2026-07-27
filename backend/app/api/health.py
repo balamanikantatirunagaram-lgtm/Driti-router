@@ -44,7 +44,7 @@ async def health_check(db: Session = Depends(get_db)):
         overall = "degraded"
 
     # CPU/Mem
-    cpu_percent = psutil.cpu_percent()
+    cpu_percent = psutil.cpu_percent(interval=0.1)
     mem = psutil.virtual_memory()
     
     # Providers

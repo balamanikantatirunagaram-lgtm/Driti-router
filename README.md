@@ -164,7 +164,7 @@ export OPENAI_BASE_URL="http://localhost:8000/v1"
 export OPENAI_API_KEY="<your-jwt-or-api-token>"
 
 # Run Aider with Auto-Routing
-aider --openai-api-base http://localhost:8000/v1 --model gpt-4o
+aider --openai-api-base http://localhost:8000/v1 --model openai/gpt-oss-120b
 ```
 
 #### For Windows (PowerShell):
@@ -172,7 +172,7 @@ aider --openai-api-base http://localhost:8000/v1 --model gpt-4o
 $env:OPENAI_BASE_URL="http://localhost:8000/v1"
 $env:OPENAI_API_KEY="<your-jwt-or-api-token>"
 
-aider --openai-api-base http://localhost:8000/v1 --model gpt-4o
+aider --openai-api-base http://localhost:8000/v1 --model openai/gpt-oss-120b
 ```
 
 ---

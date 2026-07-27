@@ -38,12 +38,9 @@ export const ModelsPage = () => {
 
   const fetchModels = async () => {
     try {
-      const [modelsRes, routingRes] = await Promise.all([
-        api.get('/api/models'),
-        api.get('/routing/config').catch(() => ({ data: { mode: 'auto' } }))
-      ]);
+      const modelsRes = await api.get('/api/models');
       setModels(modelsRes.data);
-      if (routingRes.data?.mode) setRoutingMode(routingRes.data.mode);
+      setRoutingMode('auto');
     } catch {
       toast({ title: 'Error fetching models', variant: 'destructive' });
     } finally {

@@ -80,50 +80,38 @@ def get_anthropic_models(db: Session = Depends(get_db)):
     return {"data": anthropic_models, "object": "list"}
 
 def resolve_model_for_request(payload: dict, db: Session, default_model: str, enabled_models: set) -> str:
-    from app.models.settings import AppSettings
-    settings = db.query(AppSettings).first()
-    mode = settings.routing_mode if settings and settings.routing_mode else "manual"
-    
-    if mode == "auto":
-        prompt_parts = []
-        if "system" in payload and payload["system"]:
-            prompt_parts.append(str(payload["system"]))
-        for msg in payload.get("messages", []):
-            content = msg.get("content", "")
-            if isinstance(content, list):
-                text_parts = [part.get("text", "") for part in content if isinstance(part, dict) and part.get("type") == "text"]
-                prompt_parts.append(" ".join(text_parts))
-            else:
-                prompt_parts.append(str(content))
-        full_prompt = " ".join(prompt_parts).lower()
-        prompt_len = len(full_prompt)
-        
-        heavy_keywords = ["code", "function", "script", "architect", "sql", "redis", "typescript", "python", "react", "fastapi", "docker", "kubernetes", "debug", "error", "algorithm", "database", "class", "async", "schema", "distributed", "test", "build"]
-        massive_keywords = ["100,000", "multi-region", "concurrency", "token-bucket", "enterprise", "system design", "benchmark", "production-ready", "high-throughput", "fault-tolerant", "550b", "ultra"]
-        
-        has_massive = any(k in full_prompt for k in massive_keywords) or prompt_len > 1500
-        has_heavy = any(k in full_prompt for k in heavy_keywords) or prompt_len > 400
-        
-        if has_massive and "nvidia/nemotron-3-ultra-550b-a55b" in enabled_models:
-            logger.info("[AUTO ROUTER] Massive complexity detected -> routing to: nvidia/nemotron-3-ultra-550b-a55b")
-            return "nvidia/nemotron-3-ultra-550b-a55b"
-        elif has_heavy and "nvidia/nemotron-3-super-120b-a12b" in enabled_models:
-            logger.info("[AUTO ROUTER] Heavy coding/reasoning detected -> routing to: nvidia/nemotron-3-super-120b-a12b")
-            return "nvidia/nemotron-3-super-120b-a12b"
-        elif "openai/gpt-oss-120b" in enabled_models and prompt_len > 150:
-            logger.info("[AUTO ROUTER] Analytical instruction detected -> routing to: openai/gpt-oss-120b")
-            return "openai/gpt-oss-120b"
-        elif "z-ai/glm-5.2" in enabled_models:
-            logger.info("[AUTO ROUTER] General chat detected -> routing to: z-ai/glm-5.2")
-            return "z-ai/glm-5.2"
+    prompt_parts = []
+    if "system" in payload and payload["system"]:
+        prompt_parts.append(str(payload["system"]))
+    for msg in payload.get("messages", []):
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            text_parts = [part.get("text", "") for part in content if isinstance(part, dict) and part.get("type") == "text"]
+            prompt_parts.append(" ".join(text_parts))
         else:
-            for fallback_pref in ["nvidia/nemotron-3-super-120b-a12b", "openai/gpt-oss-120b", "z-ai/glm-5.2", "nvidia/nemotron-3-ultra-550b-a55b"]:
-                if fallback_pref in enabled_models:
-                    return fallback_pref
-            return list(enabled_models)[0] if enabled_models else default_model
-            
-    logger.info(f"[MANUAL OVERRIDE] Enforcing locked default model '{default_model}' across all incoming requests.")
-    return default_model
+            prompt_parts.append(str(content))
+    full_prompt = " ".join(prompt_parts).lower()
+    prompt_len = len(full_prompt)
+    
+    heavy_keywords = ["code", "function", "script", "architect", "sql", "redis", "typescript", "python", "react", "fastapi", "docker", "kubernetes", "debug", "error", "algorithm", "database", "class", "async", "schema", "distributed", "test", "build"]
+    massive_keywords = ["100,000", "multi-region", "concurrency", "token-bucket", "enterprise", "system design", "benchmark", "production-ready", "high-throughput", "fault-tolerant", "550b", "ultra"]
+    
+    has_massive = any(k in full_prompt for k in massive_keywords) or prompt_len > 1500
+    has_heavy = any(k in full_prompt for k in heavy_keywords) or prompt_len > 400
+    
+    # Assign model according to usage and task
+    if has_massive:
+        logger.info("[AUTO ROUTER] Massive complexity detected -> routing to: nvidia/nemotron-3-ultra-550b-a55b")
+        return "nvidia/nemotron-3-ultra-550b-a55b"
+    elif has_heavy:
+        logger.info("[AUTO ROUTER] Heavy coding/reasoning detected -> routing to: nvidia/nemotron-3-super-120b-a12b")
+        return "nvidia/nemotron-3-super-120b-a12b"
+    elif prompt_len > 150:
+        logger.info("[AUTO ROUTER] Analytical instruction detected -> routing to: openai/gpt-oss-120b")
+        return "openai/gpt-oss-120b"
+    else:
+        logger.info("[AUTO ROUTER] General chat detected -> routing to: z-ai/glm-5.2")
+        return "z-ai/glm-5.2"
 
 async def anthropic_to_openai_payload(payload: dict, default_model: str, enabled_models: set = None) -> dict:
     import re
@@ -137,20 +125,12 @@ async def anthropic_to_openai_payload(payload: dict, default_model: str, enabled
         logger.info(f"Mapping requested model '{model_id}' to configured model '{default_model}'")
         model_id = default_model
     
-    booster_instructions = ""
-    if "nemotron" in model_id.lower():
-        booster_instructions = (
-            "\n\n[DRITI GATEWAY OPTIMIZATION FOR NEMOTRON]: "
-            "You are an expert AI software architect and coding assistant. "
-            "When writing code, prioritize clean, production-ready implementations with robust error handling. "
-            "If executing tool calls or function calls, provide precise arguments. "
-            "Before complex code changes, brief your architectural plan concisely."
-        )
-    elif "glm" in model_id.lower() or "gpt" in model_id.lower():
-        booster_instructions = (
-            "\n\n[DRITI GATEWAY OPTIMIZATION]: "
-            "Maintain extreme technical accuracy, concise explanations, and exact adherence to tool schemas and formatting requirements."
-        )
+    booster_instructions = (
+        "\n\n[DRITI GATEWAY TOOL ENFORCEMENT]: "
+        "CRITICAL RULE: When creating, updating, or editing code files, you MUST use file manipulation tools (e.g., Write, Edit, create_file, replace_file_content, multi_replace_file_content) directly. "
+        "NEVER output code in terminal bash commands using cat, echo, or sed. NEVER print standalone markdown code blocks as a substitute for editing files. "
+        "Invoke tools immediately and concisely without unnecessary chatter."
+    )
 
     openai_messages = []
     if "system" in payload and payload["system"]:
@@ -256,40 +236,8 @@ async def create_message(
     request: Request,
     db: Session = Depends(get_db)
 ):
-    # Authenticate via ANTHROPIC_AUTH_TOKEN header
-    auth_header = request.headers.get("anthropic-auth-token") or request.headers.get("authorization")
-    if auth_header and auth_header.startswith("Bearer "):
-        token = auth_header.split(" ")[1]
-    else:
-        token = auth_header
-        
-    if not token:
-        raise HTTPException(status_code=401, detail="Missing auth token")
-    
-    user = None
-    if token.startswith("gw_"):
-        import hashlib
-        from app.models.gateway_token import GatewayToken
-        token_hash = hashlib.sha256(token.encode()).hexdigest()
-        gw_token = db.query(GatewayToken).filter(GatewayToken.token_hash == token_hash, GatewayToken.is_active == True).first()
-        if gw_token:
-            user = db.query(User).filter(User.id == gw_token.user_id).first()
-            if user and user.is_active:
-                gw_token.last_used_at = datetime.now(timezone.utc)
-                db.commit()
-    else:
-        try:
-            from jose import jwt
-            from app.core.config import settings
-            from app.core.security import ALGORITHM
-            payload_token = jwt.decode(token, settings.SECRET_KEY, algorithms=[ALGORITHM])
-            username = payload_token.get("sub")
-            user = db.query(User).filter(User.username == username).first()
-        except Exception:
-            pass
-
-    if not user or not user.is_active:
-        raise HTTPException(status_code=401, detail="Invalid auth token")
+    from app.api.openai_compat import authenticate_universal_request
+    user = authenticate_universal_request(request, db)
 
     payload = await request.json()
     start_time = time.time()
@@ -328,7 +276,7 @@ async def create_message(
     else:
         try:
             candidates = [req_model]
-            for fallback in ["nvidia/nemotron-3-super-120b-a12b", "openai/gpt-oss-120b", "z-ai/glm-5.2", "nvidia/nemotron-3-ultra-550b-a55b"]:
+            for fallback in ["nvidia/nemotron-3-super-120b-a12b", "nvidia/nemotron-3-ultra-550b-a55b", "openai/gpt-oss-120b", "z-ai/glm-5.2"]:
                 if fallback in enabled_models and fallback not in candidates:
                     candidates.append(fallback)
                     
@@ -420,7 +368,7 @@ def _format_error(e: Exception) -> str:
         msg = f"{type(e).__name__}: Request timed out or connection closed unexpectedly."
     return msg
 
-async def _stream_generator(mapped_payload, api_key, db, user_id, start_time, ip_address, original_req_model=None):
+async def _stream_generator(mapped_payload, api_key, db, user_id, start_time, ip_address, original_req_model=None, enabled_models=None):
     req_model = original_req_model or mapped_payload["model"]
     try:
         # Send message_start
@@ -436,7 +384,7 @@ async def _stream_generator(mapped_payload, api_key, db, user_id, start_time, ip
         
         candidates = [req_model]
         if enabled_models:
-            for fallback in ["nvidia/nemotron-3-super-120b-a12b", "openai/gpt-oss-120b", "z-ai/glm-5.2", "nvidia/nemotron-3-ultra-550b-a55b"]:
+            for fallback in ["nvidia/nemotron-3-super-120b-a12b", "nvidia/nemotron-3-ultra-550b-a55b", "openai/gpt-oss-120b", "z-ai/glm-5.2"]:
                 if fallback in enabled_models and fallback not in candidates:
                     candidates.append(fallback)
                     

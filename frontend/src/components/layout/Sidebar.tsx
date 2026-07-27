@@ -1,5 +1,5 @@
 import { NavLink } from 'react-router-dom';
-import { LayoutDashboard, Cpu, Activity, Scroll, Settings, LogOut, Radio, BarChart3, Network, GitBranch, Bot, Puzzle, Users, Terminal } from 'lucide-react';
+import { LayoutDashboard, Cpu, Scroll, Settings, LogOut, BarChart3, Terminal } from 'lucide-react';
 import { useAuth } from '../../hooks/useAuth';
 import { cn } from '../../lib/utils';
 import { Button } from '../ui/button';
@@ -12,31 +12,19 @@ export const Sidebar = () => {
       title: 'Monitor',
       items: [
         { to: '/', icon: LayoutDashboard, label: 'Dashboard' },
-        { to: '/live', icon: Radio, label: 'Live Stream', badge: 'live' },
         { to: '/analytics', icon: BarChart3, label: 'Analytics' },
       ]
     },
     {
-      title: 'Agent Hub',
+      title: 'AI & Gateway',
       items: [
-        { to: '/connect', icon: Terminal, label: 'Connect & Install', badge: 'NEW' },
-        { to: '/agents', icon: Bot, label: 'Profiles & Specs' },
-      ]
-    },
-    {
-      title: 'Gateway Engine',
-      items: [
-        { to: '/models', icon: Cpu, label: 'Models' },
-        { to: '/providers', icon: Network, label: 'Providers' },
-        { to: '/routing', icon: GitBranch, label: 'Auto-Router' },
-        { to: '/mcp', icon: Puzzle, label: 'MCP Servers' },
+        { to: '/connect', icon: Terminal, label: 'Claude Code Setup', badge: 'NEW' },
+        { to: '/models', icon: Cpu, label: 'NVIDIA NIM Models' },
       ]
     },
     {
       title: 'Administration',
       items: [
-        { to: '/users', icon: Users, label: 'Users & Tokens' },
-        { to: '/health', icon: Activity, label: 'System Health' },
         { to: '/logs', icon: Scroll, label: 'Request Logs' },
         { to: '/settings', icon: Settings, label: 'Settings' },
       ]

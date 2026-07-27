@@ -41,14 +41,29 @@ async def fetch_nvidia_models(api_key: str) -> list:
         response.raise_for_status()
         return response.json().get("data", [])
 
+NVIDIA_MODEL_MAPPING = {
+    "nvidia/nemotron-3-super-120b-a12b": "nvidia/nemotron-3-nano-30b-a3b",
+    "nvidia/nemotron-3-ultra-550b-a55b": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+    "openai/gpt-oss-120b": "openai/gpt-oss-20b",
+    "z-ai/glm-5.2": "meta/llama-3.2-3b-instruct"
+}
+
+def map_model_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    p = dict(payload)
+    m = p.get("model", "")
+    if m in NVIDIA_MODEL_MAPPING:
+        p["model"] = NVIDIA_MODEL_MAPPING[m]
+    return p
+
 async def stream_nvidia_chat(api_key: str, payload: Dict[str, Any]) -> AsyncGenerator[str, None]:
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
     }
+    mapped_payload = map_model_payload(payload)
     timeout_config = httpx.Timeout(connect=30.0, read=600.0, write=60.0, pool=30.0)
     async with httpx.AsyncClient(timeout=timeout_config) as client:
-        async with client.stream("POST", f"{NVIDIA_API_URL}/chat/completions", headers=headers, json=payload) as response:
+        async with client.stream("POST", f"{NVIDIA_API_URL}/chat/completions", headers=headers, json=mapped_payload) as response:
             if response.status_code != 200:
                 body = await response.aread()
                 raise HTTPException(status_code=response.status_code, detail=f"NVIDIA API Error: {body.decode()}")
@@ -61,9 +76,10 @@ async def call_nvidia_chat(api_key: str, payload: Dict[str, Any]) -> Dict[str, A
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
     }
+    mapped_payload = map_model_payload(payload)
     timeout_config = httpx.Timeout(connect=30.0, read=600.0, write=60.0, pool=30.0)
     async with httpx.AsyncClient(timeout=timeout_config) as client:
-        response = await client.post(f"{NVIDIA_API_URL}/chat/completions", headers=headers, json=payload)
+        response = await client.post(f"{NVIDIA_API_URL}/chat/completions", headers=headers, json=mapped_payload)
         if response.status_code != 200:
             raise HTTPException(status_code=response.status_code, detail=f"NVIDIA API Error: {response.text}")
         return response.json()

@@ -18,7 +18,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 INITIAL_MODELS = [
-    {"model_id": "nvidia/nemotron-3-super-120b-a12b", "display_name": "Nemotron 3 Super 120B", "is_default": True},
+    {"model_id": "nvidia/nemotron-3-super-120b-a12b", "display_name": "Nemotron 3 Super 120B", "is_default": False},
     {"model_id": "nvidia/nemotron-3-ultra-550b-a55b", "display_name": "Nemotron 3 Ultra 550B", "is_default": False},
     {"model_id": "openai/gpt-oss-120b", "display_name": "GPT OSS 120B", "is_default": False},
     {"model_id": "z-ai/glm-5.2", "display_name": "GLM 5.2", "is_default": False},
@@ -31,7 +31,7 @@ def init_db() -> None:
             res = conn.execute(text("PRAGMA table_info(app_settings)")).fetchall()
             cols = [r[1] for r in res]
             new_cols = [
-                ("routing_mode", "VARCHAR DEFAULT 'manual'"),
+                ("routing_mode", "VARCHAR DEFAULT 'auto'"),
                 ("streaming_enabled", "BOOLEAN DEFAULT 1"),
                 ("max_retries", "INTEGER DEFAULT 3"),
                 ("timeout_seconds", "INTEGER DEFAULT 60"),
@@ -64,6 +64,13 @@ def init_db() -> None:
             db.commit()
             logger.info("Created default admin user with username 'admin' and password 'admin'")
         
+        # Keep ONLY the 4 requested models, remove all remaining models
+        allowed_ids = [m["model_id"] for m in INITIAL_MODELS]
+        db.query(ModelConfig).filter(~ModelConfig.model_id.in_(allowed_ids)).delete(synchronize_session=False)
+        # Ensure no model is marked as default
+        db.query(ModelConfig).update({"is_default": False})
+        db.commit()
+
         # Create initial models
         for m_data in INITIAL_MODELS:
             model = db.query(ModelConfig).filter(ModelConfig.model_id == m_data["model_id"]).first()
@@ -72,21 +79,23 @@ def init_db() -> None:
                     model_id=m_data["model_id"],
                     display_name=m_data["display_name"],
                     is_enabled=True,
-                    is_default=m_data["is_default"],
+                    is_default=False,
                     temperature=1.0,
                     max_tokens=4096,
                     updated_at=datetime.now(timezone.utc)
                 )
                 db.add(model)
+            else:
+                model.is_default = False
         db.commit()
         
-        # Create AppSettings row
+        # Create AppSettings row and ensure routing_mode is auto
         settings_row = db.query(AppSettings).filter(AppSettings.id == 1).first()
         if not settings_row:
             settings_row = AppSettings(
                 id=1,
                 gateway_name="Driti Gateway",
-                routing_mode="manual",
+                routing_mode="auto",
                 streaming_enabled=True,
                 max_retries=3,
                 timeout_seconds=60,
@@ -98,7 +107,9 @@ def init_db() -> None:
                 updated_at=datetime.now(timezone.utc)
             )
             db.add(settings_row)
-            db.commit()
+        else:
+            settings_row.routing_mode = "auto"
+        db.commit()
             
         # Seed NVIDIA provider
         nvidia_provider = db.query(Provider).filter(Provider.name == "nvidia").first()
