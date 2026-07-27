@@ -8,7 +8,7 @@ import { LoginPage } from './pages/LoginPage';
 import { DashboardPage } from './pages/DashboardPage';
 import { ModelsPage } from './pages/ModelsPage';
 import { SettingsPage } from './pages/SettingsPage';
-import { ClaudeCodePage } from './pages/ClaudeCodePage';
+import { ConnectPage } from './pages/ConnectPage';
 import { LogsPage } from './pages/LogsPage';
 import { HealthPage } from './pages/HealthPage';
 import { ProvidersPage } from './pages/ProvidersPage';
@@ -38,7 +38,8 @@ function App() {
               <Route path="/analytics" element={<AnalyticsPage />} />
               <Route path="/live" element={<LivePage />} />
               <Route path="/agents" element={<AgentsPage />} />
-              <Route path="/claude-code" element={<ClaudeCodePage />} />
+              <Route path="/connect" element={<ConnectPage />} />
+              <Route path="/claude-code" element={<ConnectPage />} />
               <Route path="/health" element={<HealthPage />} />
               <Route path="/logs" element={<LogsPage />} />
               <Route path="/settings" element={<SettingsPage />} />
