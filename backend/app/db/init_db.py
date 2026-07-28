@@ -7,10 +7,7 @@ from app.models.user import User
 from app.models.model_config import ModelConfig
 from app.models.settings import AppSettings
 from app.models.provider import Provider
-from app.models.agent_profile import AgentProfile
 from app.models.mcp_server import MCPServer
-from app.models.routing_rule import RoutingRule
-from app.models.audit_log import AuditLog
 from app.models.gateway_token import GatewayToken
 from datetime import datetime, timezone
 import logging
@@ -127,39 +124,6 @@ def init_db() -> None:
             )
             db.add(nvidia_provider)
             db.commit()
-
-        # Seed Agent Profiles
-        initial_profiles = [
-            {
-                "name": "claude-code",
-                "display_name": "Claude Code",
-                "capabilities": '["filesystem", "terminal", "git", "mcp", "tool_calling", "streaming"]'
-            },
-            {
-                "name": "agy",
-                "display_name": "AGY",
-                "capabilities": '["filesystem", "terminal", "git", "mcp", "tool_calling", "streaming"]'
-            },
-            {
-                "name": "generic",
-                "display_name": "Generic Agent",
-                "capabilities": '["streaming", "tool_calling"]'
-            }
-        ]
-        
-        for p_data in initial_profiles:
-            profile = db.query(AgentProfile).filter(AgentProfile.name == p_data["name"]).first()
-            if not profile:
-                profile = AgentProfile(
-                    name=p_data["name"],
-                    display_name=p_data["display_name"],
-                    capabilities=p_data["capabilities"],
-                    is_enabled=True,
-                    created_at=datetime.now(timezone.utc),
-                    updated_at=datetime.now(timezone.utc)
-                )
-                db.add(profile)
-        db.commit()
 
     except Exception as e:
         db.rollback()
