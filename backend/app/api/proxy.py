@@ -311,10 +311,21 @@ async def create_message(
             
             anthropic_content = []
             if content_text and not tool_calls:
-                import re
-                clean_content = re.sub(r'</?(?:tool_call|function|parameter|tool_use|invoke)[^>]*>', '', content_text)
-                if clean_content:
-                    anthropic_content.append({"type": "text", "text": clean_content})
+                leaked = parse_leaked_tools(content_text)
+                if leaked:
+                    for idx, lt in enumerate(leaked):
+                        anthropic_content.append({
+                            "type": "tool_use",
+                            "id": f"toolu_parsed_{int(time.time()*1000)}_{idx}",
+                            "name": lt["name"],
+                            "input": lt["arguments"]
+                        })
+                    tool_calls = True
+                else:
+                    import re
+                    clean_content = re.sub(r'</?(?:tool_call|function|parameter|tool_use|invoke)[^>]*>', '', content_text)
+                    if clean_content:
+                        anthropic_content.append({"type": "text", "text": clean_content})
             
             if tool_calls:
                 for tc in tool_calls:
@@ -375,6 +386,43 @@ def _format_error(e: Exception) -> str:
         msg = f"{type(e).__name__}: Request timed out or connection closed unexpectedly."
     return msg
 
+def parse_leaked_tools(text: str) -> list:
+    import re, json
+    tools = []
+    # 1. <function name="...">...</function> or <tool_call><function name="...">...</function></tool_call>
+    for match in re.finditer(r"<function\s+name=[\"\x27]([^\"\x27]+)[\"\x27]>(.*?)</function>", text, re.DOTALL):
+        name = match.group(1)
+        body = match.group(2)
+        args = {}
+        for p in re.finditer(r"<parameter\s+name=[\"\x27]([^\"\x27]+)[\"\x27]>(.*?)</parameter>", body, re.DOTALL):
+            val = p.group(2).strip()
+            try: val = json.loads(val)
+            except: pass
+            args[p.group(1)] = val
+        if not args:
+            try: args = json.loads(body.strip())
+            except: pass
+        tools.append({"name": name, "arguments": args})
+    # 2. <function=TOOL_NAME>{...}</function>
+    for match in re.finditer(r"<function=([a-zA-Z0-9_-]+)>(.*?)</function>", text, re.DOTALL):
+        name = match.group(1)
+        try: args = json.loads(match.group(2).strip())
+        except: args = {"input": match.group(2).strip()}
+        tools.append({"name": name, "arguments": args})
+    # 3. <tool_use>...</tool_use>
+    for match in re.finditer(r"<tool_use>(.*?)</tool_use>", text, re.DOTALL):
+        body = match.group(1)
+        name_m = re.search(r"<name>(.*?)</name>", body, re.DOTALL)
+        param_m = re.search(r"<parameters>(.*?)</parameters>", body, re.DOTALL)
+        if name_m:
+            name = name_m.group(1).strip()
+            args = {}
+            if param_m:
+                try: args = json.loads(param_m.group(1).strip())
+                except: pass
+            tools.append({"name": name, "arguments": args})
+    return tools
+
 async def _stream_generator(mapped_payload, api_key, db, user_id, start_time, ip_address, original_req_model=None, enabled_models=None):
     req_model = original_req_model or mapped_payload["model"]
     try:
@@ -387,6 +435,7 @@ async def _stream_generator(mapped_payload, api_key, db, user_id, start_time, ip
         block_index = 0
         text_started = False
         tool_blocks = {}
+        xml_buffer = ""
         finish_reason = None
         
         candidates = [req_model]
@@ -425,14 +474,17 @@ async def _stream_generator(mapped_payload, api_key, db, user_id, start_time, ip
                             tool_calls = delta.get("tool_calls", [])
                             
                             if content and not (tool_blocks or tool_calls):
-                                import re
-                                clean_content = re.sub(r'</?(?:tool_call|function|parameter|tool_use|invoke)[^>]*>', '', content)
-                                if clean_content:
-                                    if not text_started:
-                                        yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
-                                        text_started = True
-                                    yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'text_delta', 'text': clean_content}})}\n\n"
-                                    success_stream = True
+                                if "<tool_call>" in content or "<function" in content or "<tool_use>" in content or xml_buffer:
+                                    xml_buffer += content
+                                else:
+                                    import re
+                                    clean_content = re.sub(r'</?(?:tool_call|function|parameter|tool_use|invoke)[^>]*>', '', content)
+                                    if clean_content:
+                                        if not text_started:
+                                            yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+                                            text_started = True
+                                        yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'text_delta', 'text': clean_content}})}\n\n"
+                                        success_stream = True
                                 
                             for tc in tool_calls:
                                 tc_idx = tc.get("index", 0)
@@ -465,6 +517,21 @@ async def _stream_generator(mapped_payload, api_key, db, user_id, start_time, ip
                 if success_stream or attempt_idx == len(candidates) - 1:
                     raise e
                     
+        if xml_buffer and not tool_blocks:
+            leaked_tools = parse_leaked_tools(xml_buffer)
+            for idx, lt in enumerate(leaked_tools):
+                if text_started:
+                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
+                    text_started = False
+                    block_index += 1
+                t_idx = block_index + idx
+                t_id = f"toolu_parsed_{int(time.time()*1000)}_{idx}"
+                t_name = lt["name"]
+                t_args_str = json.dumps(lt["arguments"])
+                tool_blocks[t_idx] = {"id": t_id, "name": t_name, "args": t_args_str}
+                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': t_idx, 'content_block': {'type': 'tool_use', 'id': t_id, 'name': t_name, 'input': {}}})}\n\n"
+                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': t_idx, 'delta': {'type': 'input_json_delta', 'partial_json': t_args_str}})}\n\n"
+
         if not text_started and not tool_blocks:
             yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
             yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
