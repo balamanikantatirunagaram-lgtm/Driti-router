@@ -151,6 +151,7 @@ async def anthropic_to_openai_payload(payload: dict, default_model: str, enabled
             openai_messages.append({"role": role, "content": content})
         elif isinstance(content, list):
             text_parts = []
+            images = []
             tool_calls = []
             tool_results = []
             
@@ -159,6 +160,10 @@ async def anthropic_to_openai_payload(payload: dict, default_model: str, enabled
                     ptype = part.get("type")
                     if ptype == "text":
                         text_parts.append(part.get("text", ""))
+                    elif ptype == "image" and "source" in part:
+                        mime = part["source"].get("media_type", "image/jpeg")
+                        b64 = part["source"].get("data", "")
+                        images.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
                     elif ptype == "tool_use":
                         tool_calls.append({
                             "id": part.get("id", f"call_{len(tool_calls)}"),
@@ -170,11 +175,17 @@ async def anthropic_to_openai_payload(payload: dict, default_model: str, enabled
                         })
                     elif ptype == "tool_result":
                         res_content = part.get("content", "")
+                        is_error = part.get("is_error", False)
                         if isinstance(res_content, list):
                             res_content = " ".join([p.get("text", "") for p in res_content if isinstance(p, dict) and p.get("type") == "text"])
+                        
+                        final_res_str = str(res_content)
+                        if is_error:
+                            final_res_str = f"[TOOL EXECUTION ERROR]:\n{final_res_str}"
+                            
                         tool_results.append({
                             "tool_call_id": part.get("tool_use_id", ""),
-                            "content": str(res_content)
+                            "content": final_res_str
                         })
                 elif isinstance(part, str):
                     text_parts.append(part)
@@ -189,8 +200,17 @@ async def anthropic_to_openai_payload(payload: dict, default_model: str, enabled
                     msg_dict["tool_calls"] = tool_calls
                 openai_messages.append(msg_dict)
             elif role == "user":
-                if text_parts:
+                content_array = []
+                for txt in text_parts:
+                    content_array.append({"type": "text", "text": txt})
+                for img in images:
+                    content_array.append(img)
+                
+                if images:
+                    openai_messages.append({"role": "user", "content": content_array})
+                elif text_parts:
                     openai_messages.append({"role": "user", "content": " ".join(text_parts)})
+                    
                 for tr in tool_results:
                     openai_messages.append({
                         "role": "tool",
@@ -200,10 +220,14 @@ async def anthropic_to_openai_payload(payload: dict, default_model: str, enabled
             else:
                 openai_messages.append({"role": role, "content": " ".join(text_parts)})
         
+    req_max_tokens = payload.get("max_tokens", 4096)
+    if req_max_tokens > 4096:
+        req_max_tokens = 4096  # Clamp for NIM safety
+        
     mapped_payload = {
         "model": model_id,
         "messages": openai_messages,
-        "max_tokens": payload.get("max_tokens", 4096),
+        "max_tokens": req_max_tokens,
         "temperature": payload.get("temperature", 1.0),
         "stream": payload.get("stream", False)
     }
