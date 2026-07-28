@@ -1,4 +1,5 @@
 import json
+import json_repair
 import time
 from fastapi import APIRouter, Depends, Request, HTTPException
 from fastapi.responses import StreamingResponse
@@ -126,10 +127,10 @@ async def anthropic_to_openai_payload(payload: dict, default_model: str, enabled
         model_id = default_model
     
     booster_instructions = (
-        "\n\n[DRITI GATEWAY TOOL ENFORCEMENT]: "
-        "CRITICAL RULE: When creating, updating, or editing code files, you MUST use file manipulation tools (e.g., Write, Edit, create_file, replace_file_content, multi_replace_file_content) directly. "
-        "NEVER output code in terminal bash commands using cat, echo, or sed. NEVER print standalone markdown code blocks as a substitute for editing files. "
-        "Invoke tools immediately and concisely without unnecessary chatter."
+        "\n\n[ANTHROPIC CLAUDE SONNET SIMULATION SCAFFOLDING]:\n"
+        "1. TOOL INVARIANT: You are simulating Anthropic Claude 3.5 Sonnet inside the official Claude Code CLI engine. When creating, updating, or editing files, you MUST invoke file manipulation tools directly. NEVER generate standalone markdown code blocks (e.g. ```typescript) as a substitute for editing files. NEVER use cat, echo, or sed in bash commands to modify files.\n"
+        "2. SILENT EXECUTION: Execute tool calls immediately and silently. Do NOT output conversational preambles (e.g. 'I will now edit index.ts' or 'Here is the fix:') before invoking tools.\n"
+        "3. ERROR RECOVERY: If a tool or compiler returns an error, analyze the error and invoke the correcting tool immediately without panicking or looping."
     )
 
     openai_messages = []
@@ -224,7 +225,7 @@ async def anthropic_to_openai_payload(payload: dict, default_model: str, enabled
             if tc.get("type") == "tool" and "name" in tc:
                 mapped_payload["tool_choice"] = {"type": "function", "function": {"name": tc["name"]}}
             elif tc.get("type") == "any":
-                mapped_payload["tool_choice"] = "required"
+                mapped_payload["tool_choice"] = "auto"
             elif tc.get("type") == "auto":
                 mapped_payload["tool_choice"] = "auto"
                 
@@ -308,14 +309,16 @@ async def create_message(
             tool_calls = msg_obj.get("tool_calls")
             
             anthropic_content = []
-            if content_text:
+            if content_text and not tool_calls:
                 anthropic_content.append({"type": "text", "text": content_text})
             
             if tool_calls:
                 for tc in tool_calls:
                     fn = tc.get("function", {})
                     try:
-                        args = json.loads(fn.get("arguments", "{}"))
+                        raw_args = fn.get("arguments", "{}")
+                        repaired_args = json_repair.repair_json(raw_args, return_objects=True)
+                        args = repaired_args if isinstance(repaired_args, dict) else {}
                     except Exception:
                         args = {}
                     anthropic_content.append({
@@ -415,15 +418,15 @@ async def _stream_generator(mapped_payload, api_key, db, user_id, start_time, ip
                                 
                             delta = choice.get("delta", {})
                             content = delta.get("content", "")
+                            tool_calls = delta.get("tool_calls", [])
                             
-                            if content:
+                            if content and not (tool_blocks or tool_calls):
                                 if not text_started:
                                     yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
                                     text_started = True
                                 yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'text_delta', 'text': content}})}\n\n"
                                 success_stream = True
                                 
-                            tool_calls = delta.get("tool_calls", [])
                             for tc in tool_calls:
                                 tc_idx = tc.get("index", 0)
                                 if text_started:
@@ -436,12 +439,13 @@ async def _stream_generator(mapped_payload, api_key, db, user_id, start_time, ip
                                     fn = tc.get("function", {})
                                     t_id = tc.get("id", f"toolu_{int(time.time()*1000)}_{target_block_idx}")
                                     t_name = fn.get("name", "unknown_tool")
-                                    tool_blocks[target_block_idx] = {"id": t_id, "name": t_name}
+                                    tool_blocks[target_block_idx] = {"id": t_id, "name": t_name, "args": ""}
                                     yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': target_block_idx, 'content_block': {'type': 'tool_use', 'id': t_id, 'name': t_name, 'input': {}}})}\n\n"
                                     
                                 fn = tc.get("function", {})
                                 args_delta = fn.get("arguments", "")
                                 if args_delta:
+                                    tool_blocks[target_block_idx]["args"] = tool_blocks[target_block_idx].get("args", "") + args_delta
                                     yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': target_block_idx, 'delta': {'type': 'input_json_delta', 'partial_json': args_delta}})}\n\n"
                                 success_stream = True
                                     
@@ -461,6 +465,18 @@ async def _stream_generator(mapped_payload, api_key, db, user_id, start_time, ip
             if text_started:
                 yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
             for t_idx in sorted(tool_blocks.keys()):
+                raw_args = tool_blocks[t_idx].get("args", "")
+                if raw_args:
+                    try:
+                        json.loads(raw_args)
+                    except Exception:
+                        try:
+                            repaired = json_repair.repair_json(raw_args)
+                            if len(repaired) > len(raw_args):
+                                missing_suffix = repaired[len(raw_args):]
+                                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': t_idx, 'delta': {'type': 'input_json_delta', 'partial_json': missing_suffix}})}\n\n"
+                        except Exception:
+                            pass
                 yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': t_idx})}\n\n"
                 
         stop_reason = "tool_use" if (tool_blocks or finish_reason == "tool_calls") else ("end_turn" if finish_reason == "stop" else (finish_reason or "end_turn"))
