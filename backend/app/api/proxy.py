@@ -130,7 +130,8 @@ async def anthropic_to_openai_payload(payload: dict, default_model: str, enabled
         "\n\n[ANTHROPIC CLAUDE SONNET SIMULATION SCAFFOLDING]:\n"
         "1. TOOL INVARIANT: You are simulating Anthropic Claude 3.5 Sonnet inside the official Claude Code CLI engine. When creating, updating, or editing files, you MUST invoke file manipulation tools directly. NEVER generate standalone markdown code blocks (e.g. ```typescript) as a substitute for editing files. NEVER use cat, echo, or sed in bash commands to modify files.\n"
         "2. SILENT EXECUTION: Execute tool calls immediately and silently. Do NOT output conversational preambles (e.g. 'I will now edit index.ts' or 'Here is the fix:') before invoking tools.\n"
-        "3. ERROR RECOVERY: If a tool or compiler returns an error, analyze the error and invoke the correcting tool immediately without panicking or looping."
+        "3. ERROR RECOVERY: If a tool or compiler returns an error, analyze the error and invoke the correcting tool immediately without panicking or looping.\n"
+        "4. NATIVE FUNCTION CALLING ONLY: Never output raw XML, HTML, or text tags like <tool_call>, <function>, <parameter>, or </tool_call> in your text responses. You must use the API's structured native function calling channel exclusively."
     )
 
     openai_messages = []
@@ -310,7 +311,10 @@ async def create_message(
             
             anthropic_content = []
             if content_text and not tool_calls:
-                anthropic_content.append({"type": "text", "text": content_text})
+                import re
+                clean_content = re.sub(r'</?(?:tool_call|function|parameter|tool_use|invoke)[^>]*>', '', content_text)
+                if clean_content:
+                    anthropic_content.append({"type": "text", "text": clean_content})
             
             if tool_calls:
                 for tc in tool_calls:
@@ -421,11 +425,14 @@ async def _stream_generator(mapped_payload, api_key, db, user_id, start_time, ip
                             tool_calls = delta.get("tool_calls", [])
                             
                             if content and not (tool_blocks or tool_calls):
-                                if not text_started:
-                                    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
-                                    text_started = True
-                                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'text_delta', 'text': content}})}\n\n"
-                                success_stream = True
+                                import re
+                                clean_content = re.sub(r'</?(?:tool_call|function|parameter|tool_use|invoke)[^>]*>', '', content)
+                                if clean_content:
+                                    if not text_started:
+                                        yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+                                        text_started = True
+                                    yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'text_delta', 'text': clean_content}})}\n\n"
+                                    success_stream = True
                                 
                             for tc in tool_calls:
                                 tc_idx = tc.get("index", 0)
